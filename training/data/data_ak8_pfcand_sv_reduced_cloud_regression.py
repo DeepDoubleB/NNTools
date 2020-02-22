@@ -138,11 +138,11 @@ def load_data(args):
 
     if args.predict:
         test_filelist = glob.glob(args.data_test)
-        test = DataLoader(test_filelist, d, batch_size=args.batch_size, predict_mode=True, shuffle=False, args=args)
+        test = DataLoader(test_filelist, d, batch_size=args.batch_size, predict_mode=True, shuffle=False, args=args, one_hot_label=True)
         return test
     else:
-        train = DataLoader(train_val_filelist[:n_train], d, batch_size=args.batch_size, args=args)
-        val = DataLoader(train_val_filelist[n_train:], d, batch_size=args.batch_size, args=args)
+        train = DataLoader(train_val_filelist[:n_train], d, batch_size=args.batch_size, args=args, one_hot_label=True)
+        val = DataLoader(train_val_filelist[n_train:], d, batch_size=args.batch_size, args=args, one_hot_label=True)
         if not os.path.exists(output_metadata):
             train_shapes = {}
             for k, v in train.provide_data:
