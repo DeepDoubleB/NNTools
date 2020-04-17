@@ -10,10 +10,14 @@ Converts from root ntuples to PyTables files for DNN training.
 
 ### Option 1: Setup w/ LCG software stack (preferred)
 
-For centos7 (e.g., LXPLUS):
+For centos7 (e.g., LXPLUS, LPC):
 
 ```bash
 source /cvmfs/sft.cern.ch/lcg/views/LCG_96bpython3/x86_64-centos7-gcc9-opt/setup.sh
+# on LPC need to update PyTables:
+mkdir .local
+pip install --upgrade -I --prefix .local tables
+export PYTHONPATH=`pwd`/.local/lib/python3.6/site-packages:$PYTHONPATH
 ```
 
 

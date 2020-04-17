@@ -2,6 +2,9 @@
 *.log
 *.json
 *.tex
+docker_stderror
+.local
 .DS_Store
 .project
 .pydevproject
+*~

@@ -85,12 +85,20 @@ def submit(args):
     scriptfile = os.path.join(args.jobdir, 'runjob.sh')
     metadatafile = os.path.join(args.jobdir, args.metadata)
 
+    tarball = os.path.join(args.jobdir, args.tarball)
+    dir_path = os.path.dirname(os.path.realpath(__file__))
+    import tarfile
+    with tarfile.open(tarball, mode='w:gz') as archive:
+        archive.add(dir_path, arcname='preprocessing', recursive=True)
+
     if not args.resubmit:
         from helper import xrd
         md, njobs = update_metadata(args)
 
         if 'LCG_VERSION' in os.environ:
-            env_setup = 'source %s' % args.lcg_env
+            env_setup = 'source %s\n' % args.lcg_env
+            env_setup += 'tar xvzf preprocessing.tar.gz\n'
+            env_setup += 'export PYTHONPATH=`pwd`/preprocessing/.local/lib/python3.6/site-packages:$PYTHONPATH\n'
         else:
             env_setup = '''export PATH={conda_path}:$PATH
 source activate {conda_env_name}'''.format(conda_path=args.conda_path, conda_env_name=args.conda_env_name)
@@ -123,7 +131,7 @@ fi
 
 exit $status
 '''.format(env_setup=env_setup,
-           script=os.path.abspath('converter.py'),
+           script='preprocessing/converter.py',
            outputdir=args.outputdir,
            events=args.events_per_file,
            test_sample='--test-sample' if args.test_sample else '',
@@ -165,12 +173,11 @@ exit $status
 
     condordesc = '''\
 universe              = vanilla
-requirements          = (Arch == "X86_64") && (OpSysAndVer =?= "CentOS7")
 request_disk          = 10000000
 request_memory        = 8192
 executable            = {scriptfile}
 arguments             = $(jobid)
-transfer_input_files  = {metadatafile}
+transfer_input_files  = {metadatafile},{tarball}
 output                = {jobdir}/$(jobid).out
 error                 = {jobdir}/$(jobid).err
 log                   = {jobdir}/$(jobid).log
@@ -180,6 +187,7 @@ Should_Transfer_Files = YES
 queue jobid from {jobids_file}
 '''.format(scriptfile=os.path.abspath(scriptfile),
            metadatafile=os.path.abspath(metadatafile),
+           tarball = os.path.abspath(tarball),
            jobdir=os.path.abspath(args.jobdir),
            outputdir=args.outputdir,
            jobids_file=os.path.abspath(jobids_file)
@@ -218,6 +226,10 @@ def main():
     parser.add_argument('-m', '--metadata',
         default='metadata.json',
         help='Metadata json file. Default: %(default)s'
+    )
+    parser.add_argument('--tarball',
+        default='preprocessing.tar.gz',
+        help='Tarball containing preprocessing directory. Default: %(default)s'
     )
     parser.add_argument('-t', '--submittype',
         default='condor', choices=['interactive', 'condor'],
