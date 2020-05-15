@@ -1,312 +1,509 @@
-### Data class and associated helper methods
+from __future__ import print_function
 
 import numpy as np
-import tables
-import os
-import time
-from threading import Thread
-import itertools
-tables.set_blosc_max_threads(4)
 import multiprocessing
+import time
+import logging
+import tables
+tables.set_blosc_max_threads(4)
 
-class FilePreloader(Thread):
-    def __init__(self, files_list, file_open, n_ahead=2):
-        Thread.__init__(self)
-        self.deamon = True
-        self.n_concurrent = n_ahead
-        self.files_list = files_list
-        self.file_open = file_open
-        self.loaded = {} ## a dict of the loaded objects
-        self.should_stop = False
-        
-    def getFile(self, name):
-        ## locks until the file is loaded, then return the handle
-        return self.loaded.setdefault(name, self.file_open( name))
 
-    def closeFile(self,name):
-        ## close the file and
-        if name in self.loaded:
-            self.loaded.pop(name).close()
-    
-    def run(self):
-        while not self.files_list:
-            time.sleep(1)
-        for name in itertools.cycle(self.files_list):
-            if self.should_stop:
-                break
-            n_there = len(self.loaded.keys())
-            if n_there< self.n_concurrent:
-                print ("preloading",name,"with",n_there)
-                self.getFile( name )
+def add_data_args(parser):
+    data = parser.add_argument_group('Data', 'the input data')
+    data.add_argument('--data-config', type=str, help='the python file for data format')
+    data.add_argument('--data-train', type=str, help='the training data')
+    data.add_argument('--train-val-split', type=float, help='fraction of files used for training')
+    data.add_argument('--data-test', type=str, help='the test data')
+    data.add_argument('--data-example', type=str, help='the example data')
+    data.add_argument('--dryrun', action="store_true", default=False, help='Run over a small exmaple file.')
+    data.add_argument('--data-names', type=str, help='the data names')
+    data.add_argument('--label-names', type=str, help='the label names')
+    data.add_argument('--weight-names', type=str, help='the training data')
+    data.add_argument('--num-examples', type=int, help='the number of training examples')
+    data.add_argument('--syn-data', action="store_true", default=False, help='Generate dummy data on the fly.')
+    data.add_argument('--dataloader-nworkers', type=int, default=4, help='the number of threads used for data loader.')
+    data.add_argument('--dataloader-qsize', type=int, default=20, help='the queue size for data loader.')
+    data.add_argument('--dataloader-weight-scale', type=float, default=1, help='the weight scale for data loader.')
+    data.add_argument('--dataloader-max-resample', type=int, default=10, help='max times to repeat the sampling.')
+    return data
+
+class DataFormat(object):
+
+    def __init__(self, train_groups, train_vars, label_var, wgtvar, obs_vars=[], extra_label_vars=[], pad_params=None, pad_dest_vars=[], pad_src_var=None, pad_constant=None, pad_random_range=None, random_augment_vars=None, random_augment_scale=None, sort_by=None, point_mode=None, filename=None, plotting_mode=False, train_var_range=None):
+        self.train_groups = train_groups  # list
+        self.train_vars = train_vars  # dict
+        self.sort_by = sort_by  # dict {v_group:{'var':x, 'descend':False}}
+        self.label_var = label_var
+        self.wgtvar = wgtvar  # set to None if not using weights
+        self.obs_vars = obs_vars  # list
+        self.extra_label_vars = extra_label_vars  # list
+        self.point_mode = point_mode
+        self.pad_params = pad_params
+        if pad_params is None:
+            self.pad_params = {v_group:{
+                'vars':pad_dest_vars,  # list
+                'src':pad_src_var,  # str
+                'constant':pad_constant,  # float
+                'random':pad_random_range,  # list or tuple of 2 floats
+                } for v_group in train_groups}
+        else:
+            for v_group in train_groups:
+                if v_group not in self.pad_params:
+                    self.pad_params[v_group] = {'src':None, 'vars':[]}
+        if pad_params is not None and pad_src_var is not None:
+            logging.debug('Padding info:\n  ' + str(self.pad_params))
+        self.random_augment_vars = random_augment_vars  # list
+        self.random_augment_scale = random_augment_scale  # float
+        self._set_range(plotting_mode, train_var_range)
+        self._parse_file(filename)
+
+    def _set_range(self, plotting_mode, train_var_range):
+        # weight/var range
+        self.WEIGHT_MIN = 0.
+        self.WEIGHT_MAX = 1.
+        if not plotting_mode:
+            if train_var_range is None:
+                self.VAR_MIN = -5.
+                self.VAR_MAX = 5.
             else:
-                time.sleep(5)
+                self.VAR_MIN, self.VAR_MAX = train_var_range
+        else:
+            self.VAR_MIN = -1e99
+            self.VAR_MAX = 1e99
+
+    @staticmethod
+    def nevts(filename, label_var='label'):
+        with tables.open_file(filename) as f:
+            return getattr(f.root, label_var).shape[0]
+
+    @staticmethod
+    def nwgtsum(filename, weight_vars='weight,class_weight'):
+        wgt_vars = weight_vars.replace(' ', '').split(',')
+        assert len(wgt_vars) > 0
+        with tables.open_file(filename) as f:
+            return np.sum(np.prod([getattr(f.root, w) for w in wgt_vars], axis=0))
+
+    @staticmethod
+    def num_classes(filename, label_var='label'):
+        with tables.open_file(filename) as f:
+            try:
+                return getattr(f.root, label_var).shape[1]
+            except IndexError:
+                return getattr(f.root, label_var)[:].max()
+
+    def _parse_file(self, filename):
+        self.train_groups_shapes = {}
+        with tables.open_file(filename) as f:
+            self.num_classes = self.num_classes(filename, self.label_var)
+            if getattr(f.root, self.label_var).title:
+                self.class_labels = getattr(f.root, self.label_var).title.split(',')
+            else:
+                self.class_labels = [self.label_var]
+            for v_group in self.train_groups:
+                n_channels = len(self.train_vars[v_group])
+                a = getattr(f.root, self.train_vars[v_group][0])
+                if a.ndim == 3:
+                    # (n, W, H)
+                    width, height = int(a.shape[1]), int(a.shape[2])
+                elif a.ndim == 2:
+                    # (n, W)
+                    width, height = int(a.shape[1]), 1
+                elif a.ndim == 1:
+                    # (n,)
+                    width, height = 1, 1
+                else:
+                    raise RuntimeError
+                self.train_groups_shapes[v_group] = (n_channels, width, height)
+                if self.point_mode == 'NPC':
+                    self.train_groups_shapes[v_group] = (width, n_channels)
+                elif self.point_mode == 'NCP':
+                    self.train_groups_shapes[v_group] = (n_channels, width)
+
+
+class PyTableEnqueuer(object):
+    """Builds a queue out of a data generator.
+    see, e.g., https://github.com/fchollet/keras/blob/master/keras/engine/training.py
+    # Arguments
+        generator: a generator function which endlessly yields data
+        pickle_safe: use multiprocessing if True, otherwise threading
+    """
+
+    def __init__(self, filelist, data_format, batch_size, workers=4, q_size=20, shuffle=True, predict_mode=False, fetch_size=100000, up_sample=False, weight_scale=1, max_resample=20):
+        self._filelist = filelist
+        #print('filelist',self._filelist)
+        self._data_format = data_format
+        self._batch_size = batch_size
+        self._shuffle = shuffle
+        self._predict_mode = predict_mode
+        self._fetch_size = (fetch_size // batch_size + 1) * batch_size
+        #print('fetch_size',self._fetch_size)
+        self._up_sample = up_sample
+        self._weight_scale = weight_scale
+        self._max_resample = max_resample
+
+        self._workers = workers
+        self._q_size = q_size
+
+        self._lock = multiprocessing.Lock()
+        self._counter = None  # how many processes are running
+        self._threads = []
+        self._stop_event = None
+        self.queue = None
+
+        self._file_indices = None
+        self._idx = None  # position of the index for next file
+
+
+    def data_generator_task(self, ifile):
+
+        if self._stop_event.is_set():
+            # do nothing if the queue has been stopped (e.g., due to exceptions)
+            return
+
+        with self._lock:
+            # increase counter by 1
+            self._counter.value += 1
+
+        try:
+            fbegin = 0
+
+            with tables.open_file(self._filelist[ifile]) as f:
+                nevts = getattr(f.root, f.root.__members__[0]).shape[0]
+                #print('opening file',self._filelist[ifile], nevts)
+
+                while fbegin < nevts:
+                    fend = fbegin + self._fetch_size
+
+                    # --------- Read from files ----------
+                    # features
+                    X_fetch = {}
+                    for v_group in self._data_format.train_groups:
+                        pad_param = self._data_format.pad_params[v_group]
+                        # update variable ordering if needed
+                        if self._data_format.sort_by and self._data_format.sort_by[v_group]:
+                            if pad_param['src'] is not None:
+                                raise NotImplemented('Cannot do random pad and sorting at the same time now -- to be implemented')
+                            ref_a = getattr(f.root, self._data_format.sort_by[v_group]['var'])[fbegin:fend]
+                            len_a = getattr(f.root, self._data_format.sort_by[v_group]['length_var'])[fbegin:fend]
+                            for i in range(len_a.shape[0]):
+                                ref_a[i, int(len_a[i]):] = -np.inf if self._data_format.sort_by[v_group]['descend'] else np.inf
+                            if ref_a.ndim != 2:
+                                # shape should be (num_samples, num_particles)
+                                raise NotImplemented('Cannot sort variable group %s'%v_group)
+                            # https://stackoverflow.com/questions/10921893/numpy-sorting-a-multidimensional-array-by-a-multidimensional-array
+                            if self._data_format.sort_by[v_group]['descend']:
+                                sorting_indices = np.argsort(-ref_a, axis=1)
+                            else:
+                                sorting_indices = np.argsort(ref_a, axis=1)
+                            X_group = [getattr(f.root, v_name)[fbegin:fend][np.arange(ref_a.shape[0])[:, np.newaxis], sorting_indices]
+                                       for v_name in self._data_format.train_vars[v_group]]
+                        else:
+                            X_group = []
+                            pad_mask_a = None if pad_param['src'] is None else getattr(f.root, pad_param['src'])[fbegin:fend] == 0
+                            for v_name in self._data_format.train_vars[v_group]:
+                                a = getattr(f.root, v_name)[fbegin:fend]
+                                if v_name in pad_param['vars']:
+                                    if pad_mask_a is None:
+                                        raise RuntimeError('Padding `src` is not set for group %s!' % v_group)
+                                    if pad_param.get('constant', None) is not None:
+                                        a[pad_mask_a] = pad_param['constant']
+                                    elif pad_param.get('random', None) is not None:
+                                        a_rand = np.random.uniform(low=pad_param['random'][0], high=pad_param['random'][1], size=a.shape)
+                                        a[pad_mask_a] = a_rand[pad_mask_a]
+                                    else:
+                                        raise RuntimeError('Neither `constant` nor `random` is set for padding!')
+                                if not self._predict_mode and self._data_format.random_augment_vars is not None and v_name in self._data_format.random_augment_vars:
+                                    a *= np.random.normal(loc=1, scale=self._data_format.random_augment_scale, size=a.shape)
+                                X_group.append(a)
+                        
+                        shape = (-1,) + self._data_format.train_groups_shapes[v_group]  # (n, C, W, H), use -1 because end can go out of range
+                        if X_group[0].ndim == 3:
+                            # shape=(n, W, H): e.g., 2D image
+                            assert len(X_group) == 1
+                            x_arr = X_group[0]
+                        elif X_group[0].ndim < 3:
+                            # shape=(n, W) if ndim=2: (e.g., track list)
+                            # shape=(n,) if ndim=1: (glovar var)
+                            if self._data_format.point_mode == 'NPC':
+                                x_arr = np.stack(X_group, axis=-1)
+                            else:
+                                x_arr = np.stack(X_group, axis=1)
+                        else:
+                            raise NotImplemented
+    #                         if seq_order == 'channels_last':
+    #                             x_arr = x_arr.transpose((0, 2, 1))
+                        X_fetch[v_group] = np.clip(x_arr, self._data_format.VAR_MIN, self._data_format.VAR_MAX).reshape(shape)
+                        logging.debug(' -- v_group=%s, fetch_array.shape=%s, reshape=%s' % (v_group, str(X_group[0].shape), str(shape)))
+
+                    # labels
+                    y_fetch = getattr(f.root, self._data_format.label_var)[fbegin:fend]
+
+                    # observers
+                    Z_fetch = None
+                    if self._predict_mode:
+                        Z_fetch = np.stack([getattr(f.root, v_name)[fbegin:fend] for v_name in self._data_format.obs_vars], axis=1)
+
+                    # extra labels
+                    ext_fetch = None
+                    if self._data_format.extra_label_vars:
+                        ext_fetch = np.stack([getattr(f.root, v_name)[fbegin:fend] for v_name in self._data_format.extra_label_vars], axis=1)
+
+                    # weights
+                    W_fetch = None
+                    if not self._predict_mode and self._data_format.wgtvar:
+                        w_vars = self._data_format.wgtvar.replace(' ', '').split(',')
+                        wgt = getattr(f.root, w_vars[0])[fbegin:fend]
+                        for idx in range(1, len(w_vars)):
+                            wgt *= getattr(f.root, w_vars[idx])[fbegin:fend]
+                        W_fetch = wgt
+
+                    fbegin += self._fetch_size
+                    #print('fbegin',fbegin)
+                    
+                    # --------- process weight, shuffle ----------
+                    n_fetched = len(y_fetch)
+                    # sampling the array according to the weights (require weight<1)
+                    all_indices = np.arange(n_fetched)
+                    keep_indices = None
+                    if W_fetch is not None:
+                        randwgt = np.random.uniform(low=0, high=self._weight_scale, size=n_fetched)
+                        keep_flags = randwgt < W_fetch
+                        if not self._up_sample:
+                            keep_indices = all_indices[keep_flags]
+                        else:
+                            keep_indices = [all_indices[keep_flags]]
+                            n_scale = n_fetched // max(1, len(keep_indices[0]))
+                            if n_scale > self._max_resample:
+                                if ifile == 0 and fbegin == self._fetch_size:
+                                    logging.debug('n_scale=%d is larger than the max value (%d). Setting to %d' % (n_scale, self._max_resample, self._max_resample))
+                                n_scale = self._max_resample
+                            for _ in range(n_scale - 1):
+                                randwgt = np.random.uniform(size=n_fetched)
+                                keep_indices.append(all_indices[randwgt < W_fetch])
+                            keep_indices = np.concatenate(keep_indices)
+
+                    # shuffle if do training
+                    shuffle_indices = None
+                    if self._shuffle:
+                        shuffle_indices = keep_indices if keep_indices is not None else all_indices
+                        np.random.shuffle(shuffle_indices)
+
+                    if shuffle_indices is not None or keep_indices is not None:
+                        indices = shuffle_indices if shuffle_indices is not None else keep_indices
+                        for v_group in X_fetch:
+                            X_fetch[v_group] = X_fetch[v_group][indices]
+                        y_fetch = y_fetch[indices]
+                        if Z_fetch is not None:
+                            Z_fetch = Z_fetch[indices]
+                        if ext_fetch is not None:
+                            ext_fetch = ext_fetch[indices]
+
+                    # --------- put batches into the queue ----------
+                    for b in range(0, len(y_fetch), self._batch_size):
+#                         delay = np.random.uniform() / 100
+#                         time.sleep(delay)
+                        e = b + self._batch_size
+                        X_batch = {v_group:X_fetch[v_group][b:e] for v_group in X_fetch}
+                        y_batch = y_fetch[b:e]
+                        Z_batch = None if Z_fetch is None else Z_fetch[b:e]
+                        ext_batch = None if ext_fetch is None else ext_fetch[b:e]
+                        if len(y_batch) == self._batch_size:
+                            self.queue.put((X_batch, y_batch, ext_batch, Z_batch))
+        except Exception:
+            # set stop flag if any exception occurs
+            self._stop_event.set()
+            raise
+
+        with self._lock:
+            # decrease counter value by 1
+            self._counter.value -= 1
+
+    def start(self):
+        """Kicks off threads which add data from the generator into the queue.
+        # Arguments
+            workers: number of worker threads
+            max_q_size: queue size (when full, threads could block on put())
+            wait_time: time to sleep in-between calls to put()
+        """
+        logging.debug('Starting queue, file[0]=' + self._filelist[0])
+
+        try:
+            self._counter = multiprocessing.Value('i', 0)
+            self._threads = []
+            self._stop_event = multiprocessing.Event()
+            self.queue = multiprocessing.Queue(maxsize=self._q_size)
+            self._idx = 0
+            self._file_indices = np.arange(len(self._filelist))
+            np.random.shuffle(self._file_indices)
+            self.add()
+        except:
+            self.stop()
+            raise
+
+    def add(self):
+        '''Try adding a process if the pool is not full.'''
+        def run(ifile):
+            self.data_generator_task(ifile)
+
+        if len(self._threads) >= len(self._filelist):
+            # all files are processed
+            return
+
+        try:
+            if self._counter.value < self._workers:
+                # Reset random seed else all children processes
+                # share the same seed
+                np.random.seed()
+                thread = multiprocessing.Process(target=run, args=(self._file_indices[self._idx],))
+                thread.daemon = True
+                self._threads.append(thread)
+                thread.start()
+                self._idx += 1
+        except:
+            self.stop()
+            raise
+
+    def is_running(self):
+        return self._stop_event is not None and not self._stop_event.is_set() and sum([t.is_alive() for t in self._threads])
 
     def stop(self):
-        print("Stopping FilePreloader")
-        self.should_stop = True
-
-def data_class_getter(name):
-    """Returns the specified Data class"""
-    data_dict = {
-            "H5Data":H5Data,
-            }
-    try:
-        return data_dict[name]
-    except KeyError:
-        print ("{0:s} is not a known Data class. Returning None...".format(name))
-        return None
-
-
-class Data(object):
-    """Class providing an interface to the input training data.
-        Derived classes should implement the load_data function.
-        Attributes:
-          file_names: list of data files to use for training
-          batch_size: size of training batches
-    """
-
-    def __init__(self, batch_size, cache=None, spectators=False, weights=False):
-        """Stores the batch size and the names of the data files to be read.
-            Params:
-              batch_size: batch size for training
+        """Stop running threads and wait for them to exit, if necessary.
+        Should be called by the same thread which called start().
+        # Arguments
+            timeout: maximum time to wait on thread.join()
         """
-        self.batch_size = batch_size
-        self.caching_directory = cache if cache else os.environ.get('GANINMEM','')
-        self.spectators = spectators
-        self.weights = weights
-        self.fpl = None
 
-    def set_caching_directory(self, cache):
-        self.caching_directory = cache
-        
-    def set_file_names(self, file_names):
-        ## hook to copy data in /dev/shm
-        relocated = []
-        if self.caching_directory:
-            goes_to = self.caching_directory
-            goes_to += str(os.getpid())
-            os.system('mkdir %s '%goes_to)
-            os.system('rm %s/* -f'%goes_to) ## clean first if anything
-            for fn in file_names:
-                relocate = goes_to+'/'+fn.split('/')[-1]
-                if not os.path.isfile( relocate ):
-                    print ("copying %s to %s"%( fn , relocate))
-                    if os.system('cp %s %s'%( fn ,relocate))==0:
-                        relocated.append( relocate )
-                    else:
-                        print ("was enable to copy the file",fn,"to",relocate)
-                        relocated.append( fn ) ## use the initial one
-                else:
-                    relocated.append( relocate )
-                        
-            self.file_names = relocated
-        else:
-            self.file_names = file_names
-            
-        if self.fpl:
-            self.fpl.files_list = self.file_names
+        logging.debug('Stopping queue, file[0]=' + self._filelist[0])
 
-    def inf_generate_data(self):
-        """Yields batches of training data forever."""
+        if self.is_running():
+            self._stop_event.set()
+
+        for thread in self._threads:
+            if thread.is_alive():
+                thread.terminate()
+
+        if self.queue is not None:
+            self.queue.close()
+
+        self._counter = None
+        self._threads = []
+        self._stop_event = None
+        self.queue = None
+        self._file_indices = None
+        self._idx = None
+
+
+class DataLoader(object):
+    def __init__(self, filelist, data_format, batch_size, shuffle=True, predict_mode=False, fetch_size=600000, up_sample=True, one_hot_label=True, swap_axes=True, use_queue=False, args=None):
+        self._data_format = data_format
+        self._batch_size = batch_size
+        self._workers = args.dataloader_nworkers
+        self._q_size = args.dataloader_qsize
+        self._weight_scale = args.dataloader_weight_scale
+        self._max_resample = args.dataloader_max_resample
+        self._predict_mode = predict_mode
+        self._one_hot_label = one_hot_label
+        self._swap_axes = swap_axes
+        self._use_queue = use_queue
+        self.args = args
+
+        self._provide_data = []
+        for v_group in self._data_format.train_groups:
+            shape = (batch_size,) + self._data_format.train_groups_shapes[v_group]
+            self._provide_data.append((v_group, shape))
+
+        self._provide_label = [('softmax_label', (batch_size,))]
+        for v in self._data_format.extra_label_vars:
+            self._provide_label.append(('label_' + v, (batch_size,)))
+
+        h5_samples = sum([DataFormat.nevts(filename, self._data_format.label_var) for filename in filelist])
+        self.steps_per_epoch = h5_samples // batch_size
+
+        if not self.args.syn_data :
+            self.enqueuer = PyTableEnqueuer(filelist, data_format, batch_size, self._workers, self._q_size, shuffle, predict_mode, fetch_size, up_sample, weight_scale=self._weight_scale, max_resample=self._max_resample)
+            self._wait_time = 0.01  # in seconds
+
+        self.reset()
+
+    @property
+    def provide_data(self):
+        return self._provide_data
+
+    @property
+    def provide_label(self):
+        return self._provide_label
+
+    def get_truths(self):
+        return np.concatenate(self._truths)
+
+    def get_observers(self):
+        return np.concatenate(self._observers)
+
+    def __iter__(self):
+        return self
+
+    def reset(self):
+
+        self._ibatch = 0
+        self._data = None
+        self._label = None
+        # stores truths and observers
+        if self._predict_mode:
+            self._truths = []
+            self._observers = []
+
+        if not self.args.syn_data:
+            self.enqueuer.stop()
+            self.enqueuer.start()
+
+
+    def __next__(self):
+        return self.next()
+
+    def next(self):
+        self._ibatch += 1
+
+        if self.args.syn_data:
+            if self._ibatch > self.steps_per_epoch:
+                raise StopIteration
+            self._data = [np.array(np.random.uniform(size=shape)) for v_group, shape in self._provide_data]
+            self._label = [np.array(np.random.randint(self._data_format.num_classes, size=self.batch_size))]
+            for v in self._data_format.extra_label_vars:
+                self._label.append(np.random.uniform(shape=self._batch_size))
+            #return mx.io.DataBatch(self._data, self._label, provide_data=self.provide_data, provide_label=self.provide_label, pad=0)
+            return self._data, self._label
+
+        generator_output = None
         while True:
-            try:
-                for B in self.generate_data():
-                    yield B
-            except StopIteration as si:
-                print ("start over generator loop")
+            self.enqueuer.add()
+            if not self.enqueuer.queue.empty():
+                generator_output = self.enqueuer.queue.get()
+                break
+            else:
+                if not self.enqueuer.is_running():
+                    break
+                time.sleep(self._wait_time)
 
-    def generate_data(self):
-       """Yields batches of training data until none are left."""
-       leftovers = None
-       for cur_file_name in self.file_names:
-           if self.spectators and self.weights:
-               cur_file_features, cur_file_labels, cur_file_spectators, cur_file_weights = self.load_data(cur_file_name)
-           elif self.weights:
-               cur_file_features, cur_file_labels, cur_file_weights = self.load_data(cur_file_name)
-           elif self.spectators: 
-               cur_file_features, cur_file_labels, cur_file_spectators = self.load_data(cur_file_name)               
-           else:
-               cur_file_features, cur_file_labels = self.load_data(cur_file_name)
-           # concatenate any leftover data from the previous file
-           if leftovers is not None:
-               cur_file_features = self.concat_data( leftovers[0], cur_file_features )
-               cur_file_labels = self.concat_data( leftovers[1], cur_file_labels )
-               if self.spectators:
-                   cur_file_spectators = self.concat_data( leftovers[2], cur_file_spectators)                   
-               leftovers = None
-           num_in_file = self.get_num_samples( cur_file_features )
-           for cur_pos in range(0, num_in_file, self.batch_size):
-               next_pos = cur_pos + self.batch_size 
-               if next_pos <= num_in_file:
-                   if self.spectators and self.weights:
-                       yield ( self.get_batch( cur_file_features, cur_pos, next_pos, expand_dims = True , squeeze = True),
-                               self.get_batch( cur_file_labels, cur_pos, next_pos, squeeze = True ),
-                               self.get_batch( cur_file_spectators, cur_pos, next_pos, expand_dims = True, squeeze = True ),
-                               self.get_batch( cur_file_weights, cur_pos, next_pos, prod = True ) )
-                   elif self.weights:
-                       yield ( self.get_batch( cur_file_features, cur_pos, next_pos, expand_dims = True , squeeze = True),
-                               self.get_batch( cur_file_labels, cur_pos, next_pos, squeeze = True ),
-                               self.get_batch( cur_file_weights, cur_pos, next_pos, prod = True ) )
-                   elif self.spectators:
-                       yield ( self.get_batch( cur_file_features, cur_pos, next_pos, expand_dims = True , squeeze = True),
-                               self.get_batch( cur_file_labels, cur_pos, next_pos, squeeze = True ),
-                               self.get_batch( cur_file_spectators, cur_pos, next_pos, expand_dims = True ) )
-                   else:
-                       yield ( self.get_batch( cur_file_features, cur_pos, next_pos, expand_dims = True , squeeze = True),
-                               self.get_batch( cur_file_labels, cur_pos, next_pos, squeeze = True) )
-               else:
-                   if self.spectators and self.weights:
-                       leftovers = ( self.get_batch( cur_file_features, cur_pos, num_in_file, expand_dims = True, squeeze = True ),
-                                     self.get_batch( cur_file_labels, cur_pos, num_in_file, squeeze = True ),
-                                     self.get_batch( cur_file_spectators, cur_pos, num_in_file, expand_dims = True , squeeze = True),
-                                     self.get_batch( cur_file_weights, cur_pos, num_in_file, prod = True ) )
-                   elif self.weights:
-                       leftovers = ( self.get_batch( cur_file_features, cur_pos, num_in_file, expand_dims = True , squeeze = True),
-                                     self.get_batch( cur_file_labels, cur_pos, num_in_file, squeeze = True ),
-                                     self.get_batch( cur_file_weights, cur_pos, num_in_file, prod = True) )
-                   elif self.spectators:
-                       leftovers = ( self.get_batch( cur_file_features, cur_pos, num_in_file, expand_dims = True , squeeze = True),
-                                     self.get_batch( cur_file_labels, cur_pos, num_in_file, squeeze = True ),
-                                     self.get_batch( cur_file_spectators, cur_pos, num_in_file, expand_dims = True , squeeze = True) )
-                   else:
-                       leftovers = ( self.get_batch( cur_file_features, cur_pos, num_in_file, expand_dims = True , squeeze = True),
-                                     self.get_batch( cur_file_labels, cur_pos, num_in_file, squeeze = True ) )
+        if generator_output is None:
+            self.enqueuer.stop()
+            raise StopIteration
 
-    def count_data(self):
-        """Counts the number of data points across all files"""
-        num_data = 0
-        for cur_file_name in self.file_names:
-           if self.spectators and self.weights:
-               cur_file_features, cur_file_labels, cur_file_spectators, cur_file_weights = self.load_data(cur_file_name)
-           elif self.weights:
-               cur_file_features, cur_file_labels, cur_file_weights = self.load_data(cur_file_name)
-           elif self.spectators:
-               cur_file_features, cur_file_labels, cur_file_spectators = self.load_data(cur_file_name)
-           else:
-               cur_file_features, cur_file_labels = self.load_data(cur_file_name)
-           num_data += self.get_num_samples( cur_file_labels )
-        return num_data
+        X_batch, y_batch, ext_batch, Z_batch = generator_output
+        #print('\nX_batch.shape',[X_batch[v_group].shape for v_group in self._data_format.train_groups])
 
-    def is_numpy_array(self, data_array):
-        return (isinstance( data_array, np.ndarray ) or isinstance( data_array, tables.CArray ) )
-
-    def get_batch(self, data_array, start_pos, end_pos, expand_dims=False, squeeze=False, prod=False):
-        """Input: a numpy array or list of numpy arrays.
-            Gets elements between start_pos and end_pos in each array"""
-        if type(data_array) == list:
-            lout = []
-            for arr in data_array:
-                a = arr[start_pos:end_pos]
-                if expand_dims:
-                    a = np.reshape(a,a.shape+(1,))
-                lout.append(a)
-            out = np.stack(lout,axis=-1)
-            if squeeze: 
-                out = np.squeeze(out)
-            elif prod:
-                out = np.prod(out,axis=-1)
-            return out
+        self._data = [np.array(X_batch[v_group]) for v_group in self._data_format.train_groups]
+        if self._swap_axes: self._data = [d.swapaxes(-2,-1) for d in self._data]
+            
+        if self._one_hot_label:
+            self._label = [np.array(y_batch)]
         else:
-            return data_array[start_pos:end_pos] 
-
-    def concat_data(self, data1, data2):
-        """Input: data1 as numpy array or list of numpy arrays.  data2 in the same format.
-           Returns: numpy array or list of arrays, in which each array in data1 has been
-             concatenated with the corresponding array in data2"""
-        if type(data1)==list:
-            return [ self.concat_data( d1, d2 ) for d1,d2 in zip(data1,data2) ]
-        else:
-            return np.concatenate( (data1, data2) )
-
-
-    def get_num_samples(self, data_array):
-        """Input: dataset consisting of a numpy array or list of numpy arrays.
-            Output: number of samples in the dataset"""
-        if type(data_array)==list:
-            return data_array[0].shape[0]
-        else:
-            return data_array.shape[0]
-
-    def load_data(self, in_file):
-        """Input: name of file from which the data should be loaded
-            Returns: tuple (X,Y) where X and Y are numpy arrays containing features 
-                and labels, respectively, for all data in the file
-            Not implemented in base class; derived classes should implement this function"""
-        raise NotImplementedError
-
-class H5Data(Data):
-    """Loads data stored in hdf5 files
-        Attributes:
-          features_name, labels_name, spectators_name, weights_name: 
-          names of the datasets containing the features, 
-          labels, spectators, and weights respectively
-    """
-    def __init__(self, batch_size,
-                 cache=None,
-                 preloading=0,
-                 features_name=['features'],
-                 labels_name=['labels'],
-                 spectators_name = None,
-                 weights_name = None):
-        """Initializes and stores names of feature and label datasets"""
-        super(H5Data, self).__init__(batch_size,cache,(spectators_name is not None),(weights_name is not None))
-        self.features_name = features_name
-        self.labels_name = labels_name        
-        self.spectators_name = spectators_name
-        self.weights_name = weights_name
-        ## initialize the data-preloader
-        self.fpl = None
-        if preloading:
-            self.fpl = FilePreloader( [] , file_open = lambda n : tables.open_file(n,'r'), n_ahead=preloading)
-            self.fpl.start()          
-       
-
-    def load_data(self, in_file_name):
-        """Loads numpy arrays from H5 file.
-            If the features/labels groups contain more than one dataset,
-            we load them all, alphabetically by key."""
-        if self.fpl:
-            h5_file = self.fpl.getFile( in_file_name )
-        else:
-            h5_file = tables.open_file( in_file_name, 'r' )
-        X = self.load_hdf5_data( h5_file, self.features_name)
-        Y = self.load_hdf5_data( h5_file, self.labels_name)
-        if self.spectators_name is not None:
-            Z = self.load_hdf5_data( h5_file, self.spectators_name)
-        if self.weights_name is not None:
-            W = self.load_hdf5_data( h5_file, self.weights_name)
-        #if self.fpl:
-        #    self.fpl.closeFile( in_file_name )
-        #else:
-        #    h5_file.close()
-        if self.spectators_name is not None and self.weights_name is not None:
-            return X,Y,Z,W
-        elif self.spectators_name is not None:
-            return X,Y,Z
-        elif self.weights_name is not None:
-            return X,Y,W
-        else:
-            return X,Y
-
-    def load_hdf5_data(self, data_file, keys):
-        """Returns a CArray or (possibly nested) list of CArrays 
-            corresponding to the group structure of the input HDF5 data."""
-        out = []
-        for key in keys:
-            a = getattr(data_file.root,key)
-            out.append(a)
-        return out
-
-    def count_data(self):
-        """This is faster than using the parent count_data
-            because the datasets do not have to be loaded
-            as numpy arrays"""
-        num_data = 0
-        for in_file_name in self.file_names:
-            with tables.open_file(in_file_name,'r') as f:
-                num_data += getattr(f.root, self.labels_name[0]).shape[0]
-        return num_data
-
-    def finalize(self):
-        if self.fpl:
-            self.fpl.stop()
+            self._label = [np.array(np.argmax(y_batch, axis=1))]  # cannot use one-hot labelling?
+        for i, v in enumerate(self._data_format.extra_label_vars):
+            self._label.append(np.array(ext_batch[:, i]))
+        if Z_batch is not None:
+            self._truths.append(y_batch)
+            self._observers.append(Z_batch)
+            if self._ibatch % (self.steps_per_epoch // 50) == 0:
+                logging.info('Batch %d/%d' % (self._ibatch, self.steps_per_epoch))
+        return self._data, self._label
+        #return mx.io.DataBatch(self._data, self._label, provide_data=self.provide_data, provide_label=self.provide_label, pad=0)

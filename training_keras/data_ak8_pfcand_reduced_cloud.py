@@ -1,11 +1,11 @@
-from __future__ import print_function
 
-from data import H5Data
+
+from data import DataFormat, DataLoader
 import glob
 import os
 import logging
 
-label_var = ['label']
+label_var = 'label'
 train_groups = ['pfcand']
 train_vars = {}
 
@@ -108,8 +108,7 @@ obs_vars = ['orig_event_no',
     'orig_fj_corrsdmass',
     ]
 
-wgtvar = ['weight',
-          'class_weight']
+wgtvar = 'weight,class_weight'
 
 def load_data(args):
 
@@ -117,6 +116,8 @@ def load_data(args):
     train_val_filelist = glob.glob(args.data_train)
     random.shuffle(train_val_filelist)
     n_train = int(args.train_val_split * len(train_val_filelist))
+
+    d = DataFormat(train_groups, train_vars, label_var, wgtvar, obs_vars, filename=train_val_filelist[0], point_mode='NCP')
 
     logging.info('Using the following variables:\n' +
                  '\n'.join([v_group + '\n\t' + str(train_vars[v_group]) for v_group in train_groups ]))
@@ -128,34 +129,13 @@ def load_data(args):
     if args.predict:
         test_filelist = glob.glob(args.data_test)
 
-        test = H5Data(batch_size = args.batch_size,
-                      cache = None,
-                      preloading=0,
-                      features_name=train_vars['pfcand'],
-                      labels_name=label_var,
-                      spectators_name=obs_vars,
-                      weights_name=wgtvar)
-        test.set_file_names(test_filelist)
+        test = DataLoader(test_filelist, d, batch_size=args.batch_size, predict_mode=True, shuffle=False, args=args)
         return test
     else:
 
-        train = H5Data(batch_size = args.batch_size,
-                       cache = None,
-                       preloading=0,
-                       features_name=train_vars['pfcand'],
-                       labels_name=label_var,
-                       #spectators_name=obs_vars,
-                       weights_name=wgtvar)
-        train.set_file_names(train_val_filelist[:n_train])
+        train = DataLoader(train_val_filelist[:n_train], d, batch_size=args.batch_size, args=args)
+        val = DataLoader(train_val_filelist[n_train:], d, batch_size=args.batch_size, args=args)
 
-        val = H5Data(batch_size = args.batch_size,
-                     cache = None,
-                     preloading=0,
-                     features_name=train_vars['pfcand'],
-                     labels_name=label_var,
-                     #spectators_name=obs_vars,
-                     weights_name=wgtvar)
-        val.set_file_names(train_val_filelist[n_train:])
         if not os.path.exists(output_metadata):
             train_shapes = {}
             train_shapes['pfcand'] = (1,) + (100,len(train_vars['pfcand']),)
@@ -163,6 +143,25 @@ def load_data(args):
                                 var_names=train_vars, output=output_metadata)
         return (train, val)
 
+def nb_samples(files):
+    nevts = []
+    for f in files:
+        filelist = glob.glob(f)
+        nevts.append(sum([DataFormat.nevts(filename, label_var) for filename in filelist]))
+    return tuple(nevts)
+
+def nb_classes(filename):
+    return DataFormat.num_classes(filename, label_var)
+
+def nb_wgt_samples(files, weight_names):
+    if not weight_names:
+        return nb_samples(files)
+
+    nevts = []
+    for f in files:
+        filelist = glob.glob(f)
+        nevts.append(int(sum([DataFormat.nwgtsum(filename, weight_names) for filename in filelist])))
+    return tuple(nevts)
 
 def dump_input_metadata(orig_metadata, groups, shapes, var_names, output='inputs.json'):
     out = {}

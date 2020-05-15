@@ -16,7 +16,9 @@ import time
 
 import logging
 
-logging.basicConfig(level=logging.DEBUG)
+import data
+
+#logging.basicConfig(level=logging.DEBUG)
 if __name__ == '__main__':
     # location of data                                                                                                            
     train_val_fname = '/storage/user/jduarte/DNNTuples/train/train_file_*.h5'
@@ -25,14 +27,6 @@ if __name__ == '__main__':
                                  
     parser = argparse.ArgumentParser(description="train pfcands",
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--data-config', type=str, help='the python file for data format')
-    parser.add_argument('--data-train', type=str, help='the training data')
-    parser.add_argument('--train-val-split', type=float, help='fraction of files used for training')
-    parser.add_argument('--data-test', type=str, help='the test data')
-    parser.add_argument('--data-example', type=str, help='the example data')
-    parser.add_argument('--dryrun', action="store_true", default=False, help='Run over a small exmaple file.')
-    parser.add_argument('--data-names', type=str, help='the data names')
-    parser.add_argument('--num-examples', type=int, help='the number of training examples')
     parser.add_argument('--num-epochs', type=int, default=500,
                         help='max num of epochs')
     parser.add_argument('--batch-size', type=int, default=128,
@@ -48,6 +42,7 @@ if __name__ == '__main__':
     parser.add_argument('--predict', action='store_true', default=False,
                         help='run prediction instead of training')
 
+    data.add_data_args(parser)
     parser.set_defaults(
         # config
         model_prefix='models/',
@@ -72,8 +67,10 @@ if __name__ == '__main__':
 
     (train, val) = dd.load_data(args)
 
-    n_train = train.count_data()
-    n_val = val.count_data()
+    n_train_val, n_test = dd.nb_samples([args.data_train, args.data_test])
+    n_train = int(n_train_val * args.train_val_split)
+    n_val = int(n_train_val * (1 - args.train_val_split))
+
 
     if args.num_examples < 0:
         args.num_examples = n_train
@@ -106,10 +103,10 @@ if __name__ == '__main__':
     callbacks = [early_stopping, model_checkpoint]
     
     # fit keras model
-    keras_model.fit_generator(train.inf_generate_data(), 
+    keras_model.fit_generator(train, #train.inf_generate_data(), 
                               steps_per_epoch=n_train//args.batch_size, 
                               epochs=args.num_epochs, 
-                              validation_data=val.inf_generate_data(),
+                              validation_data=val, #val.inf_generate_data(),
                               validation_steps=n_val//args.batch_size,
                               shuffle=False,
                               callbacks = callbacks)
